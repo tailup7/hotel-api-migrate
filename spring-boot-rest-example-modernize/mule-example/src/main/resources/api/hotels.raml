@@ -1,0 +1,101 @@
+#%RAML 1.0
+title: Hotel API
+version: v1
+baseUri: http://localhost:8090/example/v1
+mediaType: [ application/json, application/xml ]
+types:
+  HotelText:
+    type: string
+    maxLength: 255
+  HotelInput:
+    type: object
+    properties:
+      name: HotelText
+      description?: HotelText | nil
+      city?: HotelText | nil
+      rating?: { type: integer, default: 0 }
+  Hotel:
+    type: HotelInput
+    properties:
+      id: integer
+  HotelPage:
+    type: object
+    properties:
+      content: Hotel[]
+      totalElements: integer
+      totalPages: integer
+      number: integer
+      size: integer
+      numberOfElements: integer
+      first: boolean
+      last: boolean
+      sort: object[]
+  ApiError:
+    type: object
+    properties:
+      message: string
+      detail: string
+traits:
+  errors:
+    responses:
+      400:
+        body: { application/json: { type: ApiError } }
+      404:
+        body: { application/json: { type: ApiError } }
+      500:
+        body: { application/json: { type: ApiError } }
+/hotels:
+  get:
+    is: [ errors ]
+    queryParameters:
+      page?: { type: integer, minimum: 0, default: 0 }
+      size?: { type: integer, minimum: 1, default: 100 }
+    responses:
+      200:
+        body: { application/json: { type: HotelPage } }
+  post:
+    is: [ errors ]
+    body:
+      application/json: { type: HotelInput }
+      application/xml:
+        description: XML document with hotel root element.
+        type: any
+    responses:
+      201:
+        headers:
+          Location:
+            type: string
+            description: Relative URI of the created hotel.
+  /{id}:
+    uriParameters:
+      id: { type: integer, minimum: 1 }
+    get:
+      is: [ errors ]
+      responses:
+        200:
+          body:
+            application/json: { type: Hotel }
+            application/xml: { type: any }
+    put:
+      is: [ errors ]
+      body:
+        application/json: { type: Hotel }
+        application/xml: { type: any }
+      responses:
+        204:
+    delete:
+      is: [ errors ]
+      responses:
+        204:
+/health:
+  get:
+    responses:
+      200:
+        body: { application/json: { type: object } }
+      503:
+        body: { application/json: { type: object } }
+/metrics:
+  get:
+    responses:
+      200:
+        body: { application/json: { type: object } }

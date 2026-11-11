@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+  <munit:config name="hotel-http-suite"/>
+
+  <http:request-config name="test-http">
+    <http:request-connection host="localhost" port="${http.port}"/>
+  </http:request-config>
+
+  <munit:test name="hotel-json-crud-health-and-metrics-test">
+    <munit:enable-flow-sources>
+      <munit:enable-flow-source value="hotel-api-main"/>
+    </munit:enable-flow-sources>
+    <munit:execution>
+      <http:request config-ref="test-http" method="GET" path="/example/v1/health"/>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(200)]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.status]" is="#[MunitTools::equalTo('UP')]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.database]" is="#[MunitTools::equalTo('PostgreSQL')]"/>
+
+      <http:request config-ref="test-http" method="POST" path="/example/v1/hotels">
+        <http:body>#[output application/json --- {name: 'MUnit Hotel', description: 'created by MUnit', city: 'Tokyo', rating: 4}]</http:body>
+        <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+      </http:request>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(201)]"/>
+      <set-variable variableName="hotelId" value="#[((attributes.headers.location splitBy '/')[-1]) as Number]"/>
+      <set-variable variableName="hotelPath" value="#[('/example/v1/hotels/' ++ (vars.hotelId as String))]"/>
+
+      <http:request config-ref="test-http" method="GET" path="#[vars.hotelPath]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.name]" is="#[MunitTools::equalTo('MUnit Hotel')]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.rating]" is="#[MunitTools::equalTo(4)]"/>
+
+      <http:request config-ref="test-http" method="GET" path="#[vars.hotelPath]">
+        <http:headers>#[{Accept: 'application/xml'}]</http:headers>
+      </http:request>
+      <munit-tools:assert-that expression="#[output application/java --- payload.hotel.name]" is="#[MunitTools::equalTo('MUnit Hotel')]"/>
+
+      <http:request config-ref="test-http" method="PUT" path="#[vars.hotelPath]">
+        <http:body>#[output application/json --- {id: vars.hotelId, name: 'MUnit Hotel Updated', description: 'updated', city: 'Kyoto', rating: 5}]</http:body>
+        <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+      </http:request>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(204)]"/>
+
+      <http:request config-ref="test-http" method="GET" path="#[vars.hotelPath]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.name]" is="#[MunitTools::equalTo('MUnit Hotel Updated')]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.rating]" is="#[MunitTools::equalTo(5)]"/>
+
+      <http:request config-ref="test-http" method="GET" path="/example/v1/hotels">
+        <http:query-params>#[{page: '0', size: '100'}]</http:query-params>
+      </http:request>
+      <munit-tools:assert-that expression="#[output application/java --- payload.content filter ($.id == vars.hotelId)]" is="#[MunitTools::hasSize(1)]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.sort[0].property]" is="#[MunitTools::equalTo('id')]"/>
+
+      <http:request config-ref="test-http" method="GET" path="/example/v1/metrics"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.'Khoubyari.HotelService.getAll.largePayload' &gt; 0]" is="#[MunitTools::equalTo(true)]"/>
+
+      <http:request config-ref="test-http" method="DELETE" path="#[vars.hotelPath]"/>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(204)]"/>
+
+      <http:request config-ref="test-http" method="GET" path="#[vars.hotelPath]">
+        <http:response-validator>
+          <http:success-status-code-validator values="404"/>
+        </http:response-validator>
+      </http:request>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(404)]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.message]" is="#[MunitTools::equalTo('resource not found')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="hotel-xml-and-http-errors-test">
+    <munit:enable-flow-sources>
+      <munit:enable-flow-source value="hotel-api-main"/>
+    </munit:enable-flow-sources>
+    <munit:execution>
+      <http:request config-ref="test-http" method="POST" path="/example/v1/hotels">
+        <http:body>#[output application/xml --- {hotel: {name: 'XML Hotel', city: 'Osaka', rating: 3}}]</http:body>
+        <http:headers>#[{'Content-Type': 'application/xml'}]</http:headers>
+      </http:request>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(201)]"/>
+      <set-variable variableName="hotelId" value="#[((attributes.headers.location splitBy '/')[-1]) as Number]"/>
+      <set-variable variableName="hotelPath" value="#[('/example/v1/hotels/' ++ (vars.hotelId as String))]"/>
+
+      <http:request config-ref="test-http" method="GET" path="#[vars.hotelPath]"/>
+      <munit-tools:assert-that expression="#[output application/java --- payload.name]" is="#[MunitTools::equalTo('XML Hotel')]"/>
+
+      <http:request config-ref="test-http" method="PUT" path="#[vars.hotelPath]">
+        <http:body>#[output application/json --- {id: vars.hotelId + 1, name: 'Wrong ID'}]</http:body>
+        <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+        <http:response-validator><http:success-status-code-validator values="400"/></http:response-validator>
+      </http:request>
+      <munit-tools:assert-that expression="#[output application/java --- payload.message]" is="#[MunitTools::equalTo('ID doesn\'t match!')]"/>
+
+      <http:request config-ref="test-http" method="POST" path="/example/v1/hotels">
+        <http:body>#[output application/json --- {rating: 1}]</http:body>
+        <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+        <http:response-validator><http:success-status-code-validator values="400"/></http:response-validator>
+      </http:request>
+
+      <http:request config-ref="test-http" method="POST" path="/example/v1/hotels">
+        <http:body>plain text</http:body>
+        <http:headers>#[{'Content-Type': 'text/plain'}]</http:headers>
+        <http:response-validator><http:success-status-code-validator values="415"/></http:response-validator>
+      </http:request>
+
+      <http:request config-ref="test-http" method="GET" path="/example/v1/hotels">
+        <http:query-params>#[{page: '-1'}]</http:query-params>
+        <http:response-validator><http:success-status-code-validator values="400"/></http:response-validator>
+      </http:request>
+
+      <http:request config-ref="test-http" method="PATCH" path="#[vars.hotelPath]">
+        <http:response-validator><http:success-status-code-validator values="405"/></http:response-validator>
+      </http:request>
+      <munit-tools:assert-that expression="#[attributes.headers.allow]" is="#[MunitTools::equalTo('GET, PUT, DELETE')]"/>
+
+      <http:request config-ref="test-http" method="DELETE" path="#[vars.hotelPath]"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[attributes.statusCode]" is="#[MunitTools::equalTo(204)]"/>
+    </munit:validation>
+  </munit:test>
+</mule>

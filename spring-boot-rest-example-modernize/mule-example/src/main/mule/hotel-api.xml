@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:java="http://www.mulesoft.org/schema/mule/java"
+      xmlns:spring="http://www.mulesoft.org/schema/mule/spring"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/java http://www.mulesoft.org/schema/mule/java/current/mule-java.xsd
+        http://www.mulesoft.org/schema/mule/spring http://www.mulesoft.org/schema/mule/spring/current/mule-spring.xsd">
+  <configuration-properties file="config.properties"/>
+  <spring:config name="hotel-spring" files="beans.xml"/>
+  <http:listener-config name="hotel-http">
+    <http:listener-connection host="${http.host}" port="${http.port}"/>
+  </http:listener-config>
+
+  <!-- Point API Autodiscovery at this single entry flow to cover all CRUD routes. -->
+  <flow name="hotel-api-main">
+    <http:listener config-ref="hotel-http" path="/example/v1/*">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers>#[vars.responseHeaders default {}]</http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:body>#[payload]</http:body>
+        <http:headers>#[vars.responseHeaders default {}]</http:headers>
+      </http:error-response>
+    </http:listener>
+    <set-variable variableName="requestPath" value="#[attributes.requestPath]"/>
+    <set-variable variableName="requestMethod" value="#[attributes.method]"/>
+    <set-variable variableName="wantsXml" value="#[lower(attributes.headers.accept default '') contains 'application/xml']"/>
+    <choice>
+      <when expression="#[vars.requestPath == '/example/v1/hotels']">
+        <choice>
+          <when expression="#[vars.requestMethod == 'GET']">
+            <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]"
+                         method="getAllHotels(java.lang.Integer,java.lang.Integer)">
+              <java:args>#[output application/java --- {page: (attributes.queryParams.page default 0) as Number, size: (attributes.queryParams.size default 100) as Number}]</java:args>
+            </java:invoke>
+            <set-variable variableName="xmlRoot" value="hotels"/>
+            <flow-ref name="encode-response"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'POST']">
+            <flow-ref name="read-hotel-body"/>
+            <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]"
+                         method="createHotel(java.util.Map)" target="created">
+              <java:args>#[output application/java --- {hotel: vars.hotelBody}]</java:args>
+            </java:invoke>
+            <set-variable variableName="httpStatus" value="#[201]"/>
+            <set-variable variableName="responseHeaders" value="#[output application/java --- {Location: '/example/v1/hotels/' ++ (vars.created.id as String)}]"/>
+            <set-payload value="#[null]"/>
+          </when>
+          <otherwise><raise-error type="APP:METHOD_NOT_ALLOWED" description="Method not allowed"/></otherwise>
+        </choice>
+      </when>
+      <when expression="#[vars.requestPath matches /^\/example\/v1\/hotels\/[0-9]+$/]">
+        <set-variable variableName="hotelId" value="#[(vars.requestPath splitBy '/')[-1] as Number]"/>
+        <choice>
+          <when expression="#[vars.requestMethod == 'GET']">
+            <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]"
+                         method="getHotel(long)">
+              <java:args>#[output application/java --- {id: vars.hotelId}]</java:args>
+            </java:invoke>
+            <set-variable variableName="xmlRoot" value="hotel"/>
+            <flow-ref name="encode-response"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'PUT']">
+            <flow-ref name="read-hotel-body"/>
+            <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]"
+                         method="updateHotel(long,java.util.Map)">
+              <java:args>#[output application/java --- {id: vars.hotelId, hotel: vars.hotelBody}]</java:args>
+            </java:invoke>
+            <set-variable variableName="httpStatus" value="#[204]"/>
+            <set-payload value="#[null]"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'DELETE']">
+            <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]"
+                         method="deleteHotel(long)">
+              <java:args>#[output application/java --- {id: vars.hotelId}]</java:args>
+            </java:invoke>
+            <set-variable variableName="httpStatus" value="#[204]"/>
+            <set-payload value="#[null]"/>
+          </when>
+          <otherwise><raise-error type="APP:METHOD_NOT_ALLOWED" description="Method not allowed"/></otherwise>
+        </choice>
+      </when>
+      <when expression="#[vars.requestPath == '/example/v1/health' and vars.requestMethod == 'GET']">
+        <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]" method="health()"/>
+        <set-variable variableName="httpStatus" value="#[if (payload.status == 'UP') 200 else 503]"/>
+        <set-variable variableName="xmlRoot" value="health"/>
+        <flow-ref name="encode-response"/>
+      </when>
+      <when expression="#[vars.requestPath == '/example/v1/metrics' and vars.requestMethod == 'GET']">
+        <java:invoke class="com.khoubyari.example.api.HotelApplication" instance="#[app.registry.hotelApplication]" method="metrics()"/>
+        <set-variable variableName="xmlRoot" value="metrics"/>
+        <flow-ref name="encode-response"/>
+      </when>
+      <otherwise><raise-error type="APP:NOT_FOUND" description="Resource not found"/></otherwise>
+    </choice>
+    <error-handler>
+      <on-error-continue type="JAVA:INVOCATION" when="#[Java::isCausedBy(error.cause, 'com.khoubyari.example.exception.ResourceNotFoundException')]" logException="false">
+        <set-variable variableName="httpStatus" value="#[404]"/>
+        <set-payload value='#[output application/java --- {message: "resource not found", detail: "Sorry I couldn&apos;t find it."}]'/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="JAVA:INVOCATION" when="#[Java::isCausedBy(error.cause, 'com.khoubyari.example.exception.DataFormatException')]" logException="false">
+        <set-variable variableName="httpStatus" value="#[400]"/>
+        <set-payload value="#[output application/java --- {message: Java::getRootCause(error.cause).message, detail: 'Invalid hotel data'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="EXPRESSION,JAVA:ARGUMENTS_MISMATCH" logException="false">
+        <set-variable variableName="httpStatus" value="#[400]"/>
+        <set-payload value="#[output application/java --- {message: 'Invalid request data', detail: 'Check the body, id, page and size'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:UNSUPPORTED_MEDIA_TYPE" logException="false">
+        <set-variable variableName="httpStatus" value="#[415]"/>
+        <set-payload value="#[output application/java --- {message: 'Unsupported media type', detail: 'Use application/json or application/xml'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:METHOD_NOT_ALLOWED" logException="false">
+        <set-variable variableName="httpStatus" value="#[405]"/>
+        <set-variable variableName="responseHeaders" value="#[output application/java --- {Allow: if (vars.requestPath == '/example/v1/hotels') 'GET, POST' else 'GET, PUT, DELETE'}]"/>
+        <set-payload value="#[output application/java --- {message: 'Method not allowed', detail: 'Check the HTTP method'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:NOT_FOUND" logException="false">
+        <set-variable variableName="httpStatus" value="#[404]"/>
+        <set-payload value="#[output application/java --- {message: 'Resource not found', detail: 'Check the request path'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+      <on-error-continue type="ANY" logException="true">
+        <set-variable variableName="httpStatus" value="#[500]"/>
+        <set-payload value="#[output application/java --- {message: 'Internal server error', detail: 'Contact the service administrator'}]"/>
+        <flow-ref name="encode-error"/>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+  <sub-flow name="read-hotel-body">
+    <choice>
+      <when expression="#[lower(attributes.headers.'content-type' default '') contains 'application/json']">
+        <set-variable variableName="hotelBody" value="#[output application/java --- payload as Object]"/>
+      </when>
+      <when expression="#[lower(attributes.headers.'content-type' default '') contains 'application/xml']">
+        <set-variable variableName="hotelBody" value="#[output application/java --- payload.hotel as Object]"/>
+      </when>
+      <otherwise><raise-error type="APP:UNSUPPORTED_MEDIA_TYPE" description="JSON or XML is required"/></otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="encode-error">
+    <set-variable variableName="xmlRoot" value="restErrorInfo"/>
+    <flow-ref name="encode-response"/>
+  </sub-flow>
+
+  <sub-flow name="encode-response">
+    <choice>
+      <when expression="#[vars.wantsXml default false]">
+        <set-payload value="#[output application/xml --- {(vars.xmlRoot): payload}]"/>
+      </when>
+      <otherwise>
+        <set-payload value="#[output application/json --- payload]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+</mule>

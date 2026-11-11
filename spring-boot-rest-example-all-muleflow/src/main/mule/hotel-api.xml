@@ -1,0 +1,574 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+  <configuration-properties file="config.properties"/>
+
+  <http:listener-config name="hotel-http">
+    <http:listener-connection host="${http.host}" port="${http.port}"/>
+  </http:listener-config>
+
+  <db:config name="hotel-database">
+    <db:generic-connection url="${db.url}"
+                           user="${db.username}"
+                           password="${db.password}"
+                           driverClassName="org.postgresql.Driver"/>
+  </db:config>
+
+  <!-- Spring BootのインメモリCounterServiceに相当する、アプリ単位の一時ストア。 -->
+  <os:object-store name="hotel-metrics" persistent="false" maxEntries="10"/>
+
+  <!-- API ManagerのAutodiscoveryは、この1本の入口Flowに関連付ける。 -->
+  <flow name="hotel-api-main">
+    <http:listener config-ref="hotel-http" path="/example/v1/*">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers>#[vars.responseHeaders default {}]</http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:body>#[payload]</http:body>
+        <http:headers>#[vars.responseHeaders default {}]</http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <set-variable variableName="requestPath" value="#[attributes.requestPath as String]"/>
+    <set-variable variableName="requestMethod" value="#[upper(attributes.method as String)]"/>
+    <set-variable variableName="wantsXml"
+                  value="#[lower((attributes.headers.accept default 'application/json') as String) contains 'xml']"/>
+
+    <choice>
+      <when expression="#[vars.requestPath == '/example/v1/hotels']">
+        <flow-ref name="ensure-schema"/>
+        <choice>
+          <when expression="#[vars.requestMethod == 'GET']">
+            <flow-ref name="get-all-hotels"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'POST']">
+            <flow-ref name="create-hotel"/>
+          </when>
+          <otherwise>
+            <set-variable variableName="responseHeaders" value="#[{'Allow': 'GET, POST'}]"/>
+            <raise-error type="APP:METHOD_NOT_ALLOWED" description="Method not allowed"/>
+          </otherwise>
+        </choice>
+      </when>
+
+      <when expression="#[vars.requestPath matches /^\/example\/v1\/hotels\/[0-9]+$/]">
+        <set-variable variableName="hotelId" value="#[((vars.requestPath splitBy '/')[-1]) as Number]"/>
+        <flow-ref name="ensure-schema"/>
+        <choice>
+          <when expression="#[vars.requestMethod == 'GET']">
+            <flow-ref name="get-hotel"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'PUT']">
+            <flow-ref name="update-hotel"/>
+          </when>
+          <when expression="#[vars.requestMethod == 'DELETE']">
+            <flow-ref name="delete-hotel"/>
+          </when>
+          <otherwise>
+            <set-variable variableName="responseHeaders" value="#[{'Allow': 'GET, PUT, DELETE'}]"/>
+            <raise-error type="APP:METHOD_NOT_ALLOWED" description="Method not allowed"/>
+          </otherwise>
+        </choice>
+      </when>
+
+      <when expression="#[vars.requestPath == '/example/v1/health' and vars.requestMethod == 'GET']">
+        <flow-ref name="health"/>
+      </when>
+
+      <when expression="#[vars.requestPath == '/example/v1/metrics' and vars.requestMethod == 'GET']">
+        <flow-ref name="metrics"/>
+      </when>
+
+      <when expression="#[vars.requestPath == '/example/v1/health' or vars.requestPath == '/example/v1/metrics']">
+        <set-variable variableName="responseHeaders" value="#[{'Allow': 'GET'}]"/>
+        <raise-error type="APP:METHOD_NOT_ALLOWED" description="Method not allowed"/>
+      </when>
+
+      <otherwise>
+        <raise-error type="APP:NOT_FOUND" description="Resource not found"/>
+      </otherwise>
+    </choice>
+
+    <error-handler>
+      <on-error-continue type="APP:BAD_REQUEST" logException="false">
+        <set-variable variableName="httpStatus" value="#[400]"/>
+        <set-variable variableName="errorEntity"
+                      value="#[{message: error.description default 'Invalid request data', detail: 'You messed up.'}]"/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+      <on-error-continue type="MULE:EXPRESSION" logException="false">
+        <set-variable variableName="httpStatus" value="#[400]"/>
+        <set-variable variableName="errorEntity"
+                      value="#[{message: 'Invalid request data', detail: 'Check the body, id, page and size'}]"/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:UNSUPPORTED_MEDIA_TYPE" logException="false">
+        <set-variable variableName="httpStatus" value="#[415]"/>
+        <set-variable variableName="errorEntity"
+                      value="#[{message: 'Unsupported media type', detail: 'Use application/json or application/xml'}]"/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:METHOD_NOT_ALLOWED" logException="false">
+        <set-variable variableName="httpStatus" value="#[405]"/>
+        <set-variable variableName="errorEntity"
+                      value="#[{message: 'Method not allowed', detail: 'Check the HTTP method'}]"/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+      <on-error-continue type="APP:NOT_FOUND" logException="false">
+        <set-variable variableName="httpStatus" value="#[404]"/>
+        <set-variable variableName="errorEntity"
+                      value='#[{message: "resource not found", detail: "Sorry I couldn&apos;t find it."}]'/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+      <on-error-continue type="ANY" logException="true">
+        <set-variable variableName="httpStatus" value="#[500]"/>
+        <set-variable variableName="errorEntity"
+                      value="#[{message: 'Internal server error', detail: 'Contact the service administrator'}]"/>
+        <flow-ref name="render-error"/>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+  <!-- Hibernate ddl-auto=updateの代替。DDLは冪等なので既存データを消さない。 -->
+  <sub-flow name="ensure-schema">
+    <os:retrieve objectStore="hotel-metrics" key="schema.initialized" target="schemaInitialized">
+      <os:default-value>#[false]</os:default-value>
+    </os:retrieve>
+    <choice>
+      <when expression="#[not (vars.schemaInitialized as Boolean)]">
+        <db:execute-ddl config-ref="hotel-database" target="sequenceDdlResult">
+          <db:sql><![CDATA[
+            CREATE SEQUENCE IF NOT EXISTS hibernate_sequence START WITH 1 INCREMENT BY 1
+          ]]></db:sql>
+        </db:execute-ddl>
+        <db:execute-ddl config-ref="hotel-database" target="tableDdlResult">
+          <db:sql><![CDATA[
+            CREATE TABLE IF NOT EXISTS hotel (
+              id BIGINT PRIMARY KEY,
+              name VARCHAR(255) NOT NULL,
+              description VARCHAR(255),
+              city VARCHAR(255),
+              rating INTEGER NOT NULL DEFAULT 0
+            )
+          ]]></db:sql>
+        </db:execute-ddl>
+        <os:store objectStore="hotel-metrics" key="schema.initialized">
+          <os:value>#[true]</os:value>
+        </os:store>
+      </when>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="create-hotel">
+    <set-variable variableName="requireId" value="#[false]"/>
+    <flow-ref name="read-hotel-body"/>
+    <flow-ref name="validate-hotel-body"/>
+
+    <db:select config-ref="hotel-database" target="newIdRows">
+      <db:sql>SELECT nextval('hibernate_sequence') AS "id"</db:sql>
+    </db:select>
+    <set-variable variableName="newId" value="#[vars.newIdRows[0].id as Number]"/>
+
+    <db:insert config-ref="hotel-database" target="insertResult">
+      <db:sql><![CDATA[
+        INSERT INTO hotel (id, name, description, city, rating)
+        VALUES (:id, :name, :description, :city, :rating)
+      ]]></db:sql>
+      <db:input-parameters><![CDATA[#[{
+        id: vars.newId,
+        name: vars.hotelInput.name,
+        description: vars.hotelInput.description,
+        city: vars.hotelInput.city,
+        rating: vars.hotelInput.rating
+      }]]]></db:input-parameters>
+    </db:insert>
+
+    <set-variable variableName="httpStatus" value="#[201]"/>
+    <set-variable variableName="responseHeaders"
+                  value="#[{'Location': ((attributes.headers.'x-forwarded-proto' default attributes.scheme default 'http') as String) ++ '://' ++ ((attributes.headers.'x-forwarded-host' default attributes.headers.host default ('localhost:' ++ p('http.port'))) as String) ++ '/example/v1/hotels/' ++ (vars.newId as String)}]"/>
+    <set-payload value="#[null]" mimeType="application/java"/>
+  </sub-flow>
+
+  <sub-flow name="get-all-hotels">
+    <set-variable variableName="pageNumber" value="#[((attributes.queryParams.page default '0') as Number)]"/>
+    <set-variable variableName="pageSize" value="#[((attributes.queryParams.size default '100') as Number)]"/>
+    <choice>
+      <when expression="#[vars.pageNumber &lt; 0 or vars.pageSize &lt;= 0 or floor(vars.pageNumber) != vars.pageNumber or floor(vars.pageSize) != vars.pageSize]">
+        <raise-error type="APP:BAD_REQUEST" description="page must be &gt;= 0 and size must be &gt;= 1"/>
+      </when>
+    </choice>
+    <set-variable variableName="rowOffset" value="#[vars.pageNumber * vars.pageSize]"/>
+
+    <db:select config-ref="hotel-database" target="totalRows">
+      <db:sql>SELECT COUNT(*) AS "total" FROM hotel</db:sql>
+    </db:select>
+    <db:select config-ref="hotel-database" target="hotelRows">
+      <db:sql><![CDATA[
+        SELECT id AS "id", name AS "name", description AS "description",
+               city AS "city", rating AS "rating"
+        FROM hotel
+        ORDER BY id ASC
+        LIMIT :pageSize OFFSET :rowOffset
+      ]]></db:sql>
+      <db:input-parameters><![CDATA[#[{
+        pageSize: vars.pageSize,
+        rowOffset: vars.rowOffset
+      }]]]></db:input-parameters>
+    </db:select>
+
+    <choice>
+      <when expression="#[vars.pageSize &gt; 50]">
+        <os:retrieve objectStore="hotel-metrics"
+                     key="Khoubyari.HotelService.getAll.largePayload"
+                     target="largePayloadCount">
+          <os:default-value>#[0]</os:default-value>
+        </os:retrieve>
+        <os:store objectStore="hotel-metrics" key="Khoubyari.HotelService.getAll.largePayload">
+          <os:value>#[vars.largePayloadCount + 1]</os:value>
+        </os:store>
+      </when>
+    </choice>
+
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="responseEntity"><![CDATA[%dw 2.0
+var total = (vars.totalRows[0].total default 0) as Number
+var pages = if (total == 0) 0 else ceil(total / vars.pageSize)
+var hotels = vars.hotelRows map (row) -> {
+  id: row.id as Number,
+  name: row.name as String,
+  description: row.description,
+  city: row.city,
+  rating: row.rating as Number
+}
+output application/java
+---
+{
+  content: hotels,
+  totalElements: total,
+  totalPages: pages,
+  number: vars.pageNumber,
+  size: vars.pageSize,
+  numberOfElements: sizeOf(hotels),
+  first: vars.pageNumber == 0,
+  last: vars.pageNumber >= (pages - 1),
+  sort: [{
+    property: "id",
+    direction: "ASC",
+    ascending: true,
+    descending: false,
+    ignoreCase: false,
+    nullHandling: "NATIVE"
+  }]
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+    <set-variable variableName="xmlRoot" value="hotels"/>
+    <flow-ref name="render-page"/>
+  </sub-flow>
+
+  <sub-flow name="get-hotel">
+    <flow-ref name="load-hotel"/>
+    <set-variable variableName="xmlRoot" value="hotel"/>
+    <flow-ref name="render-response"/>
+  </sub-flow>
+
+  <sub-flow name="load-hotel">
+    <db:select config-ref="hotel-database" target="hotelRows">
+      <db:sql><![CDATA[
+        SELECT id AS "id", name AS "name", description AS "description",
+               city AS "city", rating AS "rating"
+        FROM hotel
+        WHERE id = :id
+      ]]></db:sql>
+      <db:input-parameters>#[{id: vars.hotelId}]</db:input-parameters>
+    </db:select>
+    <choice>
+      <when expression="#[isEmpty(vars.hotelRows)]">
+        <raise-error type="APP:NOT_FOUND" description="resource not found"/>
+      </when>
+    </choice>
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="responseEntity"><![CDATA[%dw 2.0
+var row = vars.hotelRows[0]
+output application/java
+---
+{
+  id: row.id as Number,
+  name: row.name as String,
+  description: row.description,
+  city: row.city,
+  rating: row.rating as Number
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </sub-flow>
+
+  <sub-flow name="update-hotel">
+    <set-variable variableName="requireId" value="#[true]"/>
+    <flow-ref name="read-hotel-body"/>
+    <flow-ref name="validate-hotel-body"/>
+    <choice>
+      <when expression="#[vars.hotelInput.id != vars.hotelId]">
+        <raise-error type="APP:BAD_REQUEST" description="ID doesn't match!"/>
+      </when>
+    </choice>
+    <db:update config-ref="hotel-database" target="updateResult">
+      <db:sql><![CDATA[
+        UPDATE hotel
+        SET name = :name, description = :description, city = :city, rating = :rating
+        WHERE id = :id
+      ]]></db:sql>
+      <db:input-parameters><![CDATA[#[{
+        id: vars.hotelId,
+        name: vars.hotelInput.name,
+        description: vars.hotelInput.description,
+        city: vars.hotelInput.city,
+        rating: vars.hotelInput.rating
+      }]]]></db:input-parameters>
+    </db:update>
+    <choice>
+      <when expression="#[vars.updateResult.affectedRows == 0]">
+        <raise-error type="APP:NOT_FOUND" description="resource not found"/>
+      </when>
+    </choice>
+    <set-variable variableName="httpStatus" value="#[204]"/>
+    <set-payload value="#[null]" mimeType="application/java"/>
+  </sub-flow>
+
+  <sub-flow name="delete-hotel">
+    <db:delete config-ref="hotel-database" target="deleteResult">
+      <db:sql>DELETE FROM hotel WHERE id = :id</db:sql>
+      <db:input-parameters>#[{id: vars.hotelId}]</db:input-parameters>
+    </db:delete>
+    <choice>
+      <when expression="#[vars.deleteResult.affectedRows == 0]">
+        <raise-error type="APP:NOT_FOUND" description="resource not found"/>
+      </when>
+    </choice>
+    <set-variable variableName="httpStatus" value="#[204]"/>
+    <set-payload value="#[null]" mimeType="application/java"/>
+  </sub-flow>
+
+  <sub-flow name="read-hotel-body">
+    <choice>
+      <when expression="#[lower((attributes.headers.'content-type' default '') as String) contains 'json']">
+        <set-variable variableName="bodyIsXml" value="#[false]"/>
+        <set-variable variableName="hotelBody" value="#[output application/java --- payload as Object]"/>
+      </when>
+      <when expression="#[lower((attributes.headers.'content-type' default '') as String) contains 'xml']">
+        <set-variable variableName="bodyIsXml" value="#[true]"/>
+        <ee:transform>
+          <ee:variables>
+            <ee:set-variable variableName="hotelBody"><![CDATA[%dw 2.0
+var source = payload.hotel
+output application/java
+---
+{
+  (id: source.id as Number) if (source.id?),
+  name: if (source.name == null) null else source.name as String,
+  description: if (source.description == null) null else source.description as String,
+  city: if (source.city == null) null else source.city as String,
+  rating: (source.rating default 0) as Number
+}]]></ee:set-variable>
+          </ee:variables>
+        </ee:transform>
+      </when>
+      <otherwise>
+        <raise-error type="APP:UNSUPPORTED_MEDIA_TYPE" description="JSON or XML is required"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="validate-hotel-body">
+    <set-variable variableName="idPresent" value="#[vars.hotelBody.id?]"/>
+    <choice>
+      <when expression="#[vars.hotelBody == null or not (vars.hotelBody is Object)]">
+        <raise-error type="APP:BAD_REQUEST" description="hotel body must be an object"/>
+      </when>
+      <when expression="#[vars.hotelBody.name == null or not (vars.hotelBody.name is String)]">
+        <raise-error type="APP:BAD_REQUEST" description="name must be a string"/>
+      </when>
+      <when expression="#[isBlank(vars.hotelBody.name)]">
+        <raise-error type="APP:BAD_REQUEST" description="name is required"/>
+      </when>
+      <when expression="#[sizeOf(vars.hotelBody.name) &gt; 255]">
+        <raise-error type="APP:BAD_REQUEST" description="name must be at most 255 characters"/>
+      </when>
+      <when expression="#[vars.hotelBody.description != null and not (vars.hotelBody.description is String)]">
+        <raise-error type="APP:BAD_REQUEST" description="description must be a string"/>
+      </when>
+      <when expression="#[vars.hotelBody.description != null and sizeOf(vars.hotelBody.description) &gt; 255]">
+        <raise-error type="APP:BAD_REQUEST" description="description must be at most 255 characters"/>
+      </when>
+      <when expression="#[vars.hotelBody.city != null and not (vars.hotelBody.city is String)]">
+        <raise-error type="APP:BAD_REQUEST" description="city must be a string"/>
+      </when>
+      <when expression="#[vars.hotelBody.city != null and sizeOf(vars.hotelBody.city) &gt; 255]">
+        <raise-error type="APP:BAD_REQUEST" description="city must be at most 255 characters"/>
+      </when>
+      <when expression="#[vars.hotelBody.rating != null and not (vars.hotelBody.rating is Number) and not (vars.bodyIsXml and vars.hotelBody.rating is String and vars.hotelBody.rating matches /^-?[0-9]+$/)]">
+        <raise-error type="APP:BAD_REQUEST" description="rating must be a number"/>
+      </when>
+      <when expression="#[vars.hotelBody.rating != null and vars.hotelBody.rating is Number and floor(vars.hotelBody.rating) != vars.hotelBody.rating]">
+        <raise-error type="APP:BAD_REQUEST" description="rating must be an integer"/>
+      </when>
+      <when expression="#[vars.hotelBody.rating != null and ((vars.hotelBody.rating as Number) &lt; -2147483648 or (vars.hotelBody.rating as Number) &gt; 2147483647)]">
+        <raise-error type="APP:BAD_REQUEST" description="rating is outside the integer range"/>
+      </when>
+      <when expression="#[vars.idPresent and not (vars.hotelBody.id is Number) and not (vars.bodyIsXml and vars.hotelBody.id is String and vars.hotelBody.id matches /^[0-9]+$/)]">
+        <raise-error type="APP:BAD_REQUEST" description="id must be a non-negative integer"/>
+      </when>
+      <when expression="#[vars.idPresent and vars.hotelBody.id is Number and floor(vars.hotelBody.id) != vars.hotelBody.id]">
+        <raise-error type="APP:BAD_REQUEST" description="id must be a non-negative integer"/>
+      </when>
+      <when expression="#[vars.idPresent and (vars.hotelBody.id as Number) &lt; 0]">
+        <raise-error type="APP:BAD_REQUEST" description="id must be a non-negative integer"/>
+      </when>
+      <when expression="#[vars.requireId and (not vars.idPresent)]">
+        <raise-error type="APP:BAD_REQUEST" description="id is required when updating"/>
+      </when>
+      <when expression="#[(not vars.requireId) and vars.idPresent and (vars.hotelBody.id as Number) != 0]">
+        <raise-error type="APP:BAD_REQUEST" description="id must be omitted or 0 when creating"/>
+      </when>
+    </choice>
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="hotelInput"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  id: (vars.hotelBody.id default 0) as Number,
+  name: vars.hotelBody.name as String,
+  description: vars.hotelBody.description default null,
+  city: vars.hotelBody.city default null,
+  rating: (vars.hotelBody.rating default 0) as Number
+}]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </sub-flow>
+
+  <sub-flow name="health">
+    <try>
+      <db:select config-ref="hotel-database" target="dbPing">
+        <db:sql>SELECT 1 AS "health"</db:sql>
+      </db:select>
+      <set-variable variableName="httpStatus" value="#[200]"/>
+      <ee:transform>
+        <ee:variables>
+          <ee:set-variable variableName="responseEntity"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  status: "UP",
+  database: "PostgreSQL",
+  hotelService: {
+    status: "itsok!",
+    profile: p("hotel.service.name"),
+    details: "{ 'internals' : 'getting close to limit', 'profile' : '" ++ p("hotel.service.name") ++ "' }"
+  }
+}]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+      <error-handler>
+        <on-error-continue type="ANY" logException="false">
+          <set-variable variableName="httpStatus" value="#[503]"/>
+          <ee:transform>
+            <ee:variables>
+              <ee:set-variable variableName="responseEntity"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  status: "DOWN",
+  database: "PostgreSQL",
+  hotelService: {
+    status: "itsok!",
+    profile: p("hotel.service.name"),
+    details: "Database connectivity check failed"
+  }
+}]]></ee:set-variable>
+            </ee:variables>
+          </ee:transform>
+        </on-error-continue>
+      </error-handler>
+    </try>
+    <set-variable variableName="xmlRoot" value="health"/>
+    <flow-ref name="render-response"/>
+  </sub-flow>
+
+  <sub-flow name="metrics">
+    <os:retrieve objectStore="hotel-metrics"
+                 key="Khoubyari.HotelService.getAll.largePayload"
+                 target="largePayloadCount">
+      <os:default-value>#[0]</os:default-value>
+    </os:retrieve>
+    <set-variable variableName="responseEntity"
+                  value="#[{'Khoubyari.HotelService.getAll.largePayload': vars.largePayloadCount}]"/>
+    <set-variable variableName="xmlRoot" value="metrics"/>
+    <flow-ref name="render-response"/>
+  </sub-flow>
+
+  <sub-flow name="render-page">
+    <choice>
+      <when expression="#[vars.wantsXml default false]">
+        <ee:transform>
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+{
+  hotels: {
+    content: {hotel: vars.responseEntity.content},
+    totalElements: vars.responseEntity.totalElements,
+    totalPages: vars.responseEntity.totalPages,
+    number: vars.responseEntity.number,
+    size: vars.responseEntity.size,
+    numberOfElements: vars.responseEntity.numberOfElements,
+    first: vars.responseEntity.first,
+    last: vars.responseEntity.last,
+    sort: {sortOrder: vars.responseEntity.sort}
+  }
+}]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </when>
+      <otherwise>
+        <set-payload value="#[output application/json --- vars.responseEntity]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="render-response">
+    <choice>
+      <when expression="#[vars.wantsXml default false]">
+        <set-payload value="#[output application/xml --- {(vars.xmlRoot): vars.responseEntity}]"/>
+      </when>
+      <otherwise>
+        <set-payload value="#[output application/json --- vars.responseEntity]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <sub-flow name="render-error">
+    <choice>
+      <when expression="#[vars.wantsXml default false]">
+        <set-payload value="#[output application/xml --- {restErrorInfo: vars.errorEntity}]"/>
+      </when>
+      <otherwise>
+        <set-payload value="#[output application/json --- vars.errorEntity]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+</mule>

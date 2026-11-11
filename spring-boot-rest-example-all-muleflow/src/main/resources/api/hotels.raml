@@ -1,0 +1,131 @@
+#%RAML 1.0
+title: Hotel API - all Mule Flow
+version: v1
+baseUri: http://localhost:8090/example/v1
+mediaType: [ application/json, application/xml ]
+
+types:
+  HotelText:
+    type: string
+    maxLength: 255
+  HotelInput:
+    type: object
+    properties:
+      id?: integer
+      name: HotelText
+      description?: HotelText | nil
+      city?: HotelText | nil
+      rating?:
+        type: integer
+        default: 0
+  Hotel:
+    type: HotelInput
+    properties:
+      id: integer
+  HotelPage:
+    type: object
+    properties:
+      content: Hotel[]
+      totalElements: integer
+      totalPages: integer
+      number: integer
+      size: integer
+      numberOfElements: integer
+      first: boolean
+      last: boolean
+      sort: object[]
+  ApiError:
+    type: object
+    properties:
+      message: string
+      detail: string
+
+traits:
+  standardErrors:
+    responses:
+      400:
+        body:
+          application/json: ApiError
+          application/xml: any
+      404:
+        body:
+          application/json: ApiError
+          application/xml: any
+      405:
+        body:
+          application/json: ApiError
+          application/xml: any
+      500:
+        body:
+          application/json: ApiError
+          application/xml: any
+
+/hotels:
+  get:
+    is: [ standardErrors ]
+    queryParameters:
+      page?:
+        type: integer
+        minimum: 0
+        default: 0
+      size?:
+        type: integer
+        minimum: 1
+        default: 100
+    responses:
+      200:
+        body:
+          application/json: HotelPage
+          application/xml: any
+  post:
+    is: [ standardErrors ]
+    body:
+      application/json: HotelInput
+      application/xml: any
+    responses:
+      201:
+        headers:
+          Location: string
+  /{id}:
+    uriParameters:
+      id:
+        type: integer
+        minimum: 0
+    get:
+      is: [ standardErrors ]
+      responses:
+        200:
+          body:
+            application/json: Hotel
+            application/xml: any
+    put:
+      is: [ standardErrors ]
+      body:
+        application/json: Hotel
+        application/xml: any
+      responses:
+        204:
+    delete:
+      is: [ standardErrors ]
+      responses:
+        204:
+
+/health:
+  get:
+    responses:
+      200:
+        body:
+          application/json: object
+          application/xml: any
+      503:
+        body:
+          application/json: object
+          application/xml: any
+
+/metrics:
+  get:
+    responses:
+      200:
+        body:
+          application/json: object
+          application/xml: any
